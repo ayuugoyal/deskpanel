@@ -22,6 +22,7 @@ static class Program
         });
         builder.Logging.ClearProviders();
         builder.WebHost.UseUrls($"http://0.0.0.0:{HttpPort}");
+        builder.WebHost.ConfigureKestrel(o => o.Limits.MaxRequestBodySize = 256 * 1024);
 
         var app = builder.Build();
         // Ping every 5 s and drop a phone that stops answering within 10 s (Wi-Fi gone, phone asleep), so it never
@@ -40,7 +41,10 @@ static class Program
         {
             if (ctx.Request.Path != "/claude/hook") { await next(ctx); return; }
             var ip = ctx.Connection.RemoteIpAddress;
-            if (ctx.Request.Method != "POST" || ip == null || !System.Net.IPAddress.IsLoopback(ip)
+            // The Host check also blocks DNS-rebinding pages, which reach 127.0.0.1 under their own host name.
+            var host = ctx.Request.Host.Host;
+            bool localHost = host == "127.0.0.1" || host.Equals("localhost", StringComparison.OrdinalIgnoreCase);
+            if (ctx.Request.Method != "POST" || ip == null || !System.Net.IPAddress.IsLoopback(ip) || !localHost
                 || ctx.Request.ContentType?.StartsWith("application/json", StringComparison.OrdinalIgnoreCase) != true)
             {
                 ctx.Response.StatusCode = 403;

@@ -26,7 +26,10 @@ sealed class TrayContext : ApplicationContext
         {
             if (MessageBox.Show("Forget all paired phones? They will have to be approved again.", "DeskPanel",
                     MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
+            {
                 Pairing.ForgetAll();
+                hub.DisconnectAll();
+            }
         });
         var exit = new ToolStripMenuItem("Exit", null, (_, _) => ExitThread());
 
@@ -85,8 +88,13 @@ sealed class TrayContext : ApplicationContext
             g.FillRectangle(Brushes.White, 17, 14, 4, 9);
             g.FillRectangle(Brushes.White, 22, 9, 4, 14);
         }
-        return Icon.FromHandle(bmp.GetHicon());
+        var handle = bmp.GetHicon();
+        try { return (Icon)Icon.FromHandle(handle).Clone(); }
+        finally { DestroyIcon(handle); }
     }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    static extern bool DestroyIcon(IntPtr handle);
 }
 
 static class AutoStart

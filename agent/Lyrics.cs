@@ -16,6 +16,7 @@ sealed partial class Lyrics
     readonly object gate = new();
     readonly Dictionary<string, List<LyricLine>?> cache = new();
     string? currentKey;
+    const int MaxCached = 200;
 
     public int Version { get; private set; }
     public List<LyricLine>? Lines { get; private set; }
@@ -48,18 +49,32 @@ sealed partial class Lyrics
         _ = Task.Run(async () =>
         {
             List<LyricLine>? lines = null;
+            bool failed = false;
             try { lines = await Fetch(title, artist, duration); }
-            catch (Exception e) { Log.Error("lyrics", e); }
+            catch (Exception e) { failed = true; Log.Error("lyrics", e); }
             lock (gate)
             {
-                cache[key] = lines;
+                // only remember real answers: a network error must not turn into "no lyrics" until restart
+                if (!failed)
+                {
+                    if (cache.Count >= MaxCached) cache.Clear();
+                    cache[key] = lines;
+                }
                 if (currentKey != key) return;
                 Lines = lines;
                 Version++;
             }
+            if (failed) _ = RetryLater(key);
             Log.Info($"lyrics for \"{title}\": {(lines == null ? "none" : lines.Count + " lines")}");
             Changed?.Invoke();
         });
+    }
+
+    /// <summary>After a failed lookup, let the same track be looked up again in a minute.</summary>
+    async Task RetryLater(string key)
+    {
+        await Task.Delay(TimeSpan.FromMinutes(1));
+        lock (gate) if (currentKey == key) currentKey = null;
     }
 
     public void Clear()
@@ -82,11 +97,19 @@ sealed partial class Lyrics
         if (artist.Length > 0)
             urls.Add($"https://lrclib.net/api/search?track_name={Uri.EscapeDataString(track)}&artist_name={Uri.EscapeDataString(artist)}");
         urls.Add($"https://lrclib.net/api/search?q={Uri.EscapeDataString((artist + " " + track).Trim())}");
-        if (artist.Length > 0) urls.Add($"https://lrclib.net/api/search?q={Uri.EscapeDataString(track)}");
+        // A title-only search can match another artist's song, so use it only when the duration can confirm the match.
+        if (artist.Length > 0 && duration > 0) urls.Add($"https://lrclib.net/api/search?q={Uri.EscapeDataString(track)}");
 
+        bool anyAnswered = false;
+        Exception? lastError = null;
         foreach (var url in urls)
         {
-            using var doc = JsonDocument.Parse(await Http.GetStringAsync(url));
+            string body;
+            try { body = await Http.GetStringAsync(url); }
+            catch (Exception e) when (e is HttpRequestException or TaskCanceledException) { lastError = e; continue; }
+            anyAnswered = true;
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind != JsonValueKind.Array) continue;
             JsonElement? best = null;
             double bestDiff = double.MaxValue;
             foreach (var r in doc.RootElement.EnumerateArray())
@@ -103,6 +126,8 @@ sealed partial class Lyrics
                 if (lines.Count > 0) return lines;
             }
         }
+        // every query failed: report it, so the caller retries later instead of remembering "no lyrics"
+        if (!anyAnswered && lastError != null) throw lastError;
         return null;
     }
 

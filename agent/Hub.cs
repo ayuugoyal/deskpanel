@@ -29,8 +29,21 @@ sealed class Hub
     StatsSample? lastStats;
     int pushQueued;
 
+    // Unknown phones trigger a dialog on the laptop. After a refusal or timeout the same address must wait,
+    // and only a few unauthenticated sockets may be open at once, so nothing on the LAN can flood the laptop with pop-ups.
+    static readonly TimeSpan PairCooldown = TimeSpan.FromSeconds(20);
+    const int MaxUnauthenticated = 8;
+    readonly ConcurrentDictionary<string, DateTime> pairBlockedUntil = new();
+    int unauthenticated;
+
     public ClaudeTracker Claude { get; } = new();
     public int ClientCount => clients.Count;
+
+    /// <summary>Drops every connected phone (e.g. after "Forget paired phones"); they must pair again to come back.</summary>
+    public void DisconnectAll()
+    {
+        foreach (var c in clients.Keys) c.Ws.Abort();
+    }
 
     sealed record Snapshot(string StateJson, int ArtVersion, string? Art, int LyricsVersion, string LyricsJson);
 
@@ -45,6 +58,14 @@ sealed class Hub
         var c = new Client(ws);
         var buf = new byte[8192];
         using var ms = new MemoryStream();
+        var address = remote?.MapToIPv4().ToString() ?? "?";
+        bool counted = true;
+        if (Interlocked.Increment(ref unauthenticated) > MaxUnauthenticated)
+        {
+            Interlocked.Decrement(ref unauthenticated);
+            ws.Abort();
+            return;
+        }
         try
         {
             // 1. The phone introduces itself with its key; unknown phones must be approved on the laptop once.
@@ -60,6 +81,11 @@ sealed class Hub
             Task<string?>? carried = null;
             if (!Pairing.IsKnown(token))
             {
+                if (pairBlockedUntil.TryGetValue(address, out var until) && until > DateTime.UtcNow)
+                {
+                    await Send(c, JsonSerializer.Serialize(new { type = "rejected" }, Json));
+                    return;
+                }
                 var name = Trunc((string?)hello["name"] ?? "Phone", 40);
                 await Send(c, JsonSerializer.Serialize(new { type = "pairing" }, Json));
 
@@ -67,7 +93,7 @@ sealed class Hub
                 // socket survives a slow click) and tells us if the phone leaves (then the dialog is skipped).
                 carried = ReceiveText(ws, buf, ms, ct);
                 using var askCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                var ask = Pairing.Ask(name, remote?.MapToIPv4().ToString() ?? "?", askCts.Token);
+                var ask = Pairing.Ask(name, address, askCts.Token);
                 if (await Task.WhenAny(ask, carried) == carried)
                 {
                     askCts.Cancel(); // the phone left or spoke out of turn
@@ -77,6 +103,7 @@ sealed class Hub
                 var newToken = await ask;
                 if (newToken == null)
                 {
+                    pairBlockedUntil[address] = DateTime.UtcNow + PairCooldown;
                     await Send(c, JsonSerializer.Serialize(new { type = "rejected" }, Json));
                     return;
                 }
@@ -85,8 +112,10 @@ sealed class Hub
 
             // 2. Paired: stream the state, accept commands.
             clients[c] = 0;
+            counted = false;
+            Interlocked.Decrement(ref unauthenticated);
             Log.Info($"phone connected from {remote} ({clients.Count} total)");
-            await PushTo(c, await Build(sampleStats: true), skipIfBusy: false);
+            await PushTo(c, await Build(sampleStats: false), skipIfBusy: false);
             while (ws.State == WebSocketState.Open && !ct.IsCancellationRequested)
             {
                 var text = carried != null ? await carried : await ReceiveText(ws, buf, ms, ct);
@@ -99,6 +128,7 @@ sealed class Hub
         catch (Exception e) { Log.Error("client", e); }
         finally
         {
+            if (counted) Interlocked.Decrement(ref unauthenticated);
             if (clients.TryRemove(c, out _))
             {
                 Log.Info($"phone disconnected ({clients.Count} left)");
@@ -132,6 +162,7 @@ sealed class Hub
         {
             try
             {
+                Claude.Tick();
                 if (tick++ % 2 == 0) Claude.Scan();
                 if (!clients.IsEmpty) await Broadcast(await Build(sampleStats: true));
             }

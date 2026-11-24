@@ -15,10 +15,22 @@ sealed class MediaSource
     public int ArtVersion { get; private set; }
     public string? ArtBase64 { get; private set; }
 
+    readonly object managerGate = new();
+
     async Task<GlobalSystemMediaTransportControlsSession?> Session()
     {
-        manager ??= GlobalSystemMediaTransportControlsSessionManager.RequestAsync().AsTask();
-        return (await manager).GetCurrentSession();
+        Task<GlobalSystemMediaTransportControlsSessionManager> request;
+        lock (managerGate) request = manager ??= GlobalSystemMediaTransportControlsSessionManager.RequestAsync().AsTask();
+        try
+        {
+            return (await request).GetCurrentSession();
+        }
+        catch
+        {
+            // do not keep a failed request forever: ask again next time
+            lock (managerGate) if (ReferenceEquals(manager, request)) manager = null;
+            throw;
+        }
     }
 
     public async Task<MediaInfo?> Get()

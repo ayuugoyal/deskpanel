@@ -37,6 +37,8 @@ sealed class PendingPermission
 sealed class ClaudeTracker
 {
     public const int ApprovalSeconds = 60;
+    /// <summary>Longest command/detail the phone may approve. Longer ones are left to the terminal so nothing hidden is approved.</summary>
+    public const int MaxApprovalDetail = 600;
 
     const string AllowJson = """{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}""";
     const string DenyJson = """{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","message":"Denied from the DeskPanel phone."}}}""";
@@ -46,7 +48,8 @@ sealed class ClaudeTracker
 
     public event Action? Changed;
 
-    public object Snapshot()
+    /// <summary>Time-based housekeeping. Call regularly (the hub loop does); <see cref="Snapshot"/> only reads.</summary>
+    public void Tick()
     {
         var now = DateTime.UtcNow;
         lock (gate)
@@ -54,11 +57,19 @@ sealed class ClaudeTracker
             foreach (var s in sessions.Values.ToList())
             {
                 var quiet = now - s.LastEvent;
-                if (quiet > TimeSpan.FromHours(3)) { sessions.Remove(s.Id); continue; }
+                // Sessions still listed in ~/.claude/sessions are removed by Scan() when their process ends; dropping
+                // them here would only make Scan() re-create them with their counters reset.
+                if (quiet > TimeSpan.FromHours(3) && !s.FromRegistry) { sessions.Remove(s.Id); continue; }
                 if (s.State == "done" && quiet > TimeSpan.FromMinutes(10)) Set(s, "idle", "Sleeping");
                 if (s.State == "working" && quiet > TimeSpan.FromMinutes(15)) Set(s, "idle", "Quiet for a while");
             }
+        }
+    }
 
+    public object Snapshot()
+    {
+        lock (gate)
+        {
             return sessions.Values
                 .OrderBy(s => s.Started)
                 .Select(s => new
@@ -131,6 +142,13 @@ sealed class ClaudeTracker
                         Set(s, "input", "Waiting for you");
                         break;
                     case "PermissionRequest":
+                        var detail = Detail(tool, input);
+                        if (detail.Length > MaxApprovalDetail)
+                        {
+                            // the phone could only show part of it: never approve what cannot be read in full
+                            Set(s, "waiting", "Asking in the terminal");
+                            break;
+                        }
                         Set(s, "waiting", $"Wants to use {FriendlyTool(tool)}");
                         if (phoneConnected())
                         {
@@ -139,7 +157,7 @@ sealed class ClaudeTracker
                                 Id = Guid.NewGuid().ToString("N"),
                                 SessionId = sid,
                                 Tool = FriendlyTool(tool),
-                                Detail = Detail(tool, input),
+                                Detail = detail,
                                 Expires = DateTime.UtcNow.AddSeconds(ApprovalSeconds),
                             };
                             s.Pending?.Decision.TrySetResult("");
@@ -354,7 +372,7 @@ sealed class ClaudeTracker
             "WebSearch" => Str(input, "query"),
             _ => input?.ToJsonString(new JsonSerializerOptions { WriteIndented = false }) ?? "",
         };
-        return Trunc(d, 600);
+        return d;
     }
 
     static string FriendlyTool(string tool)

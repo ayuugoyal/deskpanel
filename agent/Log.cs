@@ -8,7 +8,7 @@ static class Log
 
     public static void Info(string message) => Write("info", message);
 
-    public static void Error(string what, Exception e) => Write("error", $"{what}: {e.GetType().Name}: {e.Message}");
+    public static void Error(string what, Exception e) => Write("error", $"{what}: {e}");
 
     static void Write(string level, string message)
     {

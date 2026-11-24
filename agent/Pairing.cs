@@ -85,6 +85,9 @@ static class Pairing
     static void Save(Store s)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
-        File.WriteAllText(FilePath, JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true }));
+        // write beside the target, then swap, so a crash mid-write cannot wipe the paired phones
+        var temp = FilePath + ".tmp";
+        File.WriteAllText(temp, JsonSerializer.Serialize(s, new JsonSerializerOptions { WriteIndented = true }));
+        File.Move(temp, FilePath, overwrite: true);
     }
 }
